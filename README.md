@@ -1,0 +1,1 @@
+# Hackaton_Rnd25-SSD_Squad
