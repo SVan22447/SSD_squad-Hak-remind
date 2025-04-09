@@ -6,6 +6,11 @@ config.json
 *.dump
 *.backup
 
+# Игнорирование файла базы данных SQLite3
+*.sqlite3
+db.sqlite3
+*db
+
 # Distribution / packaging
 .Python
 env/
