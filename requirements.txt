@@ -1,0 +1,9 @@
+email-validator==2.2.0
+flask==3.1.0
+flask-sqlalchemy==3.1.1
+gunicorn==23.0.0
+psycopg2-binary==2.9.10
+python-telegram-bot==20.4
+python-telegram-bot[job-queue]==20.4
+telegram==0.0.1
+nest_asyncio==1.6.0
