@@ -31,7 +31,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-#Берёт токен из config.json
 with open("config.json") as f:
     config=json.load(f)
 TOKEN=config["TOKEN"]
@@ -39,6 +38,7 @@ TOKEN=config["TOKEN"]
 # Константы для ConversationHandler
 MENU, TEAM, TEAM_NAME, TEAM_MEMBERS, TEAM_VIEW = range(5)
 REMINDER, REMINDER_CREATE, REMINDER_TEAM, REMINDER_TEXT, REMINDER_DATE, REMINDER_TIME, REMINDER_VIEW = range(5, 12)
+INVITES, INVITE_ACTIONS, TEAM_LEAVE = range(12, 15)  # Новые состояния для управления приглашениями и выходом из команды
 
 # Хранилище данных пользователя
 user_data_dict: Dict[int, Dict[str, Any]] = {}
@@ -86,6 +86,20 @@ class Database:
                 reminder_text TEXT NOT NULL,
                 team_name TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            
+            # Таблица приглашений в команды
+            self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS team_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id INTEGER NOT NULL,
+                team_name TEXT NOT NULL,
+                invited_username TEXT NOT NULL,
+                invited_by INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (team_id) REFERENCES teams (id)
             )
             ''')
             
@@ -200,6 +214,283 @@ class Database:
             logger.error(f"Ошибка получения напоминаний: {e}")
             return []
     
+    def add_team_invite(self, team_id, team_name, invited_username, invited_by):
+        """Добавление приглашения в команду.
+        
+        Args:
+            team_id (int): ID команды
+            team_name (str): Название команды
+            invited_username (str): Username приглашаемого
+            invited_by (int): ID пользователя, отправившего приглашение
+            
+        Returns:
+            int: ID приглашения или None при ошибке
+        """
+        try:
+            self.cursor.execute(
+                "INSERT INTO team_invites (team_id, team_name, invited_username, invited_by) VALUES (?, ?, ?, ?)",
+                (team_id, team_name, invited_username, invited_by)
+            )
+            self.conn.commit()
+            invite_id = self.cursor.lastrowid
+            logger.info(f"Создано приглашение #{invite_id} для пользователя {invited_username} в команду {team_name}")
+            return invite_id
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка создания приглашения: {e}")
+            return None
+            
+    def get_pending_invites(self, username=None):
+        """Получение ожидающих приглашений.
+        
+        Args:
+            username (str, optional): Фильтр по username пользователя
+            
+        Returns:
+            list: Список приглашений
+        """
+        try:
+            if username:
+                self.cursor.execute(
+                    "SELECT * FROM team_invites WHERE invited_username = ? AND status = 'pending'",
+                    (username,)
+                )
+            else:
+                self.cursor.execute("SELECT * FROM team_invites WHERE status = 'pending'")
+                
+            invites = self.cursor.fetchall()
+            
+            return [{
+                'id': invite['id'],
+                'team_id': invite['team_id'],
+                'team_name': invite['team_name'],
+                'invited_username': invite['invited_username'],
+                'invited_by': invite['invited_by'],
+                'created_at': invite['created_at']
+            } for invite in invites]
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка получения приглашений: {e}")
+            return []
+            
+    def update_invite_status(self, invite_id, status):
+        """Обновление статуса приглашения.
+        
+        Args:
+            invite_id (int): ID приглашения
+            status (str): Новый статус ('accepted', 'rejected', 'canceled')
+            
+        Returns:
+            bool: Успех операции
+        """
+        try:
+            self.cursor.execute(
+                "UPDATE team_invites SET status = ? WHERE id = ?",
+                (status, invite_id)
+            )
+            self.conn.commit()
+            logger.info(f"Статус приглашения #{invite_id} изменен на {status}")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка обновления статуса приглашения: {e}")
+            return False
+            
+    def add_user_to_team(self, team_id, user_id):
+        """Добавление пользователя в команду.
+        
+        Args:
+            team_id (int): ID команды
+            user_id (int): ID пользователя
+            
+        Returns:
+            bool: Успех операции
+        """
+        try:
+            # Получаем текущий список участников
+            self.cursor.execute("SELECT members FROM teams WHERE id = ?", (team_id,))
+            team = self.cursor.fetchone()
+            
+            if not team:
+                logger.error(f"Команда с ID {team_id} не найдена")
+                return False
+                
+            members = json.loads(team['members'])
+            
+            # Проверяем, не состоит ли пользователь уже в команде
+            if user_id in members:
+                logger.info(f"Пользователь {user_id} уже состоит в команде {team_id}")
+                return True
+                
+            # Добавляем пользователя в список
+            members.append(user_id)
+            members_json = json.dumps(members)
+            
+            # Обновляем список участников команды
+            self.cursor.execute(
+                "UPDATE teams SET members = ? WHERE id = ?",
+                (members_json, team_id)
+            )
+            self.conn.commit()
+            logger.info(f"Пользователь {user_id} добавлен в команду {team_id}")
+            return True
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка добавления пользователя в команду: {e}")
+            return False
+            
+    def remove_user_from_team(self, team_id, user_id):
+        """Удаление пользователя из команды.
+        
+        Args:
+            team_id (int): ID команды
+            user_id (int): ID пользователя
+            
+        Returns:
+            bool: Успех операции
+        """
+        try:
+            # Получаем текущий список участников и данные о команде
+            self.cursor.execute("SELECT members, created_by FROM teams WHERE id = ?", (team_id,))
+            team = self.cursor.fetchone()
+            
+            if not team:
+                logger.error(f"Команда с ID {team_id} не найдена")
+                return False
+                
+            members = json.loads(team['members'])
+            created_by = team['created_by']
+            
+            # Проверяем, состоит ли пользователь в команде
+            if user_id not in members:
+                logger.info(f"Пользователь {user_id} не состоит в команде {team_id}")
+                return True
+                
+            # Удаляем пользователя из списка
+            members.remove(user_id)
+            members_json = json.dumps(members)
+            
+            # Обновляем список участников команды
+            self.cursor.execute(
+                "UPDATE teams SET members = ? WHERE id = ?",
+                (members_json, team_id)
+            )
+            self.conn.commit()
+            logger.info(f"Пользователь {user_id} удален из команды {team_id}")
+            return True
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка удаления пользователя из команды: {e}")
+            return False
+            
+    def delete_reminder(self, reminder_id):
+        """Удаление напоминания.
+        
+        Args:
+            reminder_id (int): ID напоминания
+            
+        Returns:
+            bool: Успех операции
+        """
+        try:
+            self.cursor.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+            self.conn.commit()
+            logger.info(f"Напоминание {reminder_id} удалено")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка удаления напоминания: {e}")
+            return False
+            
+    def delete_team(self, team_id):
+        """Удаление команды.
+        
+        Args:
+            team_id (int): ID команды
+            
+        Returns:
+            bool: Успех операции
+        """
+        try:
+            # Получаем информацию о команде
+            team = self.get_team_by_id(team_id)
+            if not team:
+                logger.error(f"Команда с ID {team_id} не найдена")
+                return False
+                
+            # Удаляем связанные напоминания
+            self.cursor.execute("DELETE FROM reminders WHERE team_name = ?", (team['name'],))
+            
+            # Удаляем команду
+            self.cursor.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+            
+            # Отменяем все приглашения в эту команду
+            self.cursor.execute(
+                "UPDATE team_invites SET status = 'canceled' WHERE team_id = ? AND status = 'pending'", 
+                (team_id,)
+            )
+            
+            self.conn.commit()
+            logger.info(f"Команда {team_id} удалена")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка удаления команды: {e}")
+            return False
+            
+    def get_team_by_id(self, team_id):
+        """Получение информации о команде по ID.
+        
+        Args:
+            team_id (int): ID команды
+            
+        Returns:
+            dict: Информация о команде или None при ошибке
+        """
+        try:
+            self.cursor.execute("SELECT * FROM teams WHERE id = ?", (team_id,))
+            team = self.cursor.fetchone()
+            
+            if not team:
+                return None
+                
+            return {
+                'id': team['id'],
+                'name': team['name'],
+                'members': json.loads(team['members']),
+                'created_by': team['created_by']
+            }
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка получения информации о команде: {e}")
+            return None
+            
+    def get_invite_by_id(self, invite_id):
+        """Получение информации о приглашении по ID.
+        
+        Args:
+            invite_id (int): ID приглашения
+            
+        Returns:
+            dict: Информация о приглашении или None при ошибке
+        """
+        try:
+            self.cursor.execute("SELECT * FROM team_invites WHERE id = ?", (invite_id,))
+            invite = self.cursor.fetchone()
+            
+            if not invite:
+                return None
+                
+            return {
+                'id': invite['id'],
+                'team_id': invite['team_id'],
+                'team_name': invite['team_name'],
+                'invited_username': invite['invited_username'],
+                'invited_by': invite['invited_by'],
+                'status': invite['status'],
+                'created_at': invite['created_at']
+            }
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка получения информации о приглашении: {e}")
+            return None
+    
     def close(self):
         """Закрытие соединения с базой данных."""
         if self.conn:
@@ -213,9 +504,21 @@ db = Database()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отображение главного меню с кнопками."""
+    user = update.effective_user
+    username = user.username
+    
+    # Проверяем наличие приглашений для пользователя
+    if username:
+        invites = db.get_pending_invites(username)
+        invites_count = len(invites)
+        invite_button_text = f"Приглашения ({invites_count})" if invites_count > 0 else "Приглашения"
+    else:
+        invite_button_text = "Приглашения"
+        
     keyboard = [
         [InlineKeyboardButton("Команды", callback_data='commands'),
-         InlineKeyboardButton("Личные напоминания", callback_data='personal_reminders')]
+         InlineKeyboardButton("Личные напоминания", callback_data='personal_reminders')],
+        [InlineKeyboardButton(invite_button_text, callback_data='invites')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Пожалуйста выберите:", reply_markup=reply_markup)
@@ -225,18 +528,46 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     """Обработка выбора в главном меню."""
     query = update.callback_query
     await query.answer()
-
+    
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    
+    # Проверяем наличие приглашений для пользователя
+    if username:
+        pending_invites = db.get_pending_invites(username)
+        
+        if pending_invites:
+            # Если есть приглашения, показываем их
+            invites_text = "У вас есть приглашения в команды:\n\n"
+            keyboard = []
+            
+            for invite in pending_invites:
+                invites_text += f"👥 Команда: {invite['team_name']}\n"
+                keyboard.append([
+                    InlineKeyboardButton("✅ Принять", callback_data=f"accept_invite_{invite['id']}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_invite_{invite['id']}")
+                ])
+            
+            keyboard.append([InlineKeyboardButton("В главное меню", callback_data="back_to_main")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(invites_text, reply_markup=reply_markup)
+            return INVITES
+    
+    # Обычная обработка главного меню, если нет приглашений
     if query.data == 'commands':
+        # Переход в меню команд
         keyboard = [
             [InlineKeyboardButton("Создать команду", callback_data='create_team'),
              InlineKeyboardButton("Просмотреть команды", callback_data='view_teams')],
+            [InlineKeyboardButton("Выйти из команды", callback_data='leave_team')],
             [InlineKeyboardButton("Назад", callback_data='back_to_main')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("Выберите действие с командами:", reply_markup=reply_markup)
         return TEAM
-
+    
     elif query.data == 'personal_reminders':
+        # Переход в меню напоминаний
         keyboard = [
             [InlineKeyboardButton("Создать напоминание", callback_data='create_reminder'),
              InlineKeyboardButton("Просмотреть напоминания", callback_data='view_reminders')],
@@ -245,19 +576,15 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("Выберите действие с напоминаниями:", reply_markup=reply_markup)
         return REMINDER
-
-    elif query.data == 'back_to_main':
-        # Возврат в главное меню
-        keyboard = [
-            [InlineKeyboardButton("Команды", callback_data='commands'),
-             InlineKeyboardButton("Личные напоминания", callback_data='personal_reminders')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("Пожалуйста выберите:", reply_markup=reply_markup)
-        return MENU
-
+    
+    # Главное меню
+    keyboard = [
+        [InlineKeyboardButton("Команды", callback_data='commands'),
+         InlineKeyboardButton("Личные напоминания", callback_data='personal_reminders')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Пожалуйста выберите:", reply_markup=reply_markup)
     return MENU
-
 async def team_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка меню команд."""
     query = update.callback_query
@@ -287,11 +614,81 @@ async def team_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(team_text, reply_markup=reply_markup)
         return TEAM_VIEW
+
+    elif query.data == 'delete_team':
+        # Проверяем, состоит ли пользователь в каких-либо командах
+        user_id = update.effective_user.id
+        teams = db.get_teams(user_id)
+        
+        if not teams:
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='back_to_team')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "У вас нет команд для удаления.",
+                reply_markup=reply_markup
+            )
+            return TEAM
+            
+        # Показываем список команд для удаления
+        delete_text = "Выберите команду для удаления:\n\n"
+        keyboard = []
+        
+        for team in teams:
+            # Проверяем, является ли пользователь создателем команды
+            if team['created_by'] == user_id:
+                delete_text += f"📋 {team['name']} (вы создатель)\n"
+                keyboard.append([InlineKeyboardButton(f"Удалить команду {team['name']}", callback_data=f"confirm_delete_{team['id']}")])
+            else:
+                delete_text += f"📋 {team['name']} (вы участник, но не создатель)\n"
+                
+        keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_team')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(delete_text, reply_markup=reply_markup)
+        return TEAM
+        
+    elif query.data.startswith('confirm_delete_'):
+        # Удаление команды
+        user_id = update.effective_user.id
+        team_id = int(query.data.split('_')[-1])
+        team = db.get_team_by_id(team_id)
+        
+        if not team:
+            await query.edit_message_text("Команда не найдена.")
+            return ConversationHandler.END
+            
+        # Проверяем, является ли пользователь создателем команды
+        if team['created_by'] != user_id:
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='delete_team')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "Вы не можете удалить эту команду, так как не являетесь её создателем.",
+                reply_markup=reply_markup
+            )
+            return TEAM
+            
+        # Удаляем команду
+        success = db.delete_team(team_id)
+        
+        if success:
+            keyboard = [
+                [InlineKeyboardButton("К командам", callback_data='back_to_team')],
+                [InlineKeyboardButton("В главное меню", callback_data='back_to_main')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"Команда '{team['name']}' успешно удалена.\nВсе связанные напоминания и приглашения также удалены.",
+                reply_markup=reply_markup
+            )
+            return TEAM
+        else:
+            await query.edit_message_text("Произошла ошибка при удалении команды.")
+            return ConversationHandler.END
     
     elif query.data == 'back_to_team':
         keyboard = [
             [InlineKeyboardButton("Создать команду", callback_data='create_team'),
              InlineKeyboardButton("Просмотреть команды", callback_data='view_teams')],
+            [InlineKeyboardButton("Удалить команду", callback_data='delete_team')],
             [InlineKeyboardButton("Назад", callback_data='back_to_main')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -336,20 +733,45 @@ async def team_members_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     # Если пользователь ввел "готово", сохраняем команду с текущими участниками
     if members_text.lower() == 'готово':
         team_name = user_data_dict[user_id]['team_name']
-        member_ids = user_data_dict[user_id]['team_members']
         
-        success = db.add_team(team_name, member_ids, user_id)
+        # Сначала создаем команду только с создателем
+        initial_members = [user_id]  # Только создатель в качестве начального участника
+        success = db.add_team(team_name, initial_members, user_id)
         
         if success:
-            keyboard = [
-                [InlineKeyboardButton("В главное меню", callback_data='back_to_main')],
-                [InlineKeyboardButton("К командам", callback_data='back_to_team')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                f"Команда '{team_name}' успешно создана с {len(member_ids)} участниками!",
-                reply_markup=reply_markup
-            )
+            # Получаем ID созданной команды
+            teams = db.get_teams(user_id)
+            team_id = None
+            for team in teams:
+                if team['name'] == team_name:
+                    team_id = team['id']
+                    break
+            
+            if team_id:
+                # Отправка приглашений всем указанным пользователям
+                invited_usernames = user_data_dict[user_id].get('invited_usernames', [])
+                for username in invited_usernames:
+                    invite_id = db.add_team_invite(team_id, team_name, username, user_id)
+                    if invite_id:
+                        logger.info(f"Создано приглашение #{invite_id} для пользователя {username} в команду {team_name}")
+                
+                keyboard = [
+                    [InlineKeyboardButton("В главное меню", callback_data='back_to_main')],
+                    [InlineKeyboardButton("К командам", callback_data='back_to_team')]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                invite_message = ""
+                if invited_usernames:
+                    invite_message = f"\n\nПриглашения отправлены пользователям: {', '.join(['@' + username for username in invited_usernames])}"
+                
+                await update.message.reply_text(
+                    f"Команда '{team_name}' успешно создана!{invite_message}",
+                    reply_markup=reply_markup
+                )
+            else:
+                await update.message.reply_text("Произошла ошибка при создании команды. Не удалось получить ID команды.")
+                return ConversationHandler.END
         else:
             await update.message.reply_text("Произошла ошибка при создании команды. Попробуйте еще раз.")
             return ConversationHandler.END
@@ -358,27 +780,19 @@ async def team_members_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Список для хранения username'ов для приглашения
     usernames = [username.strip().lstrip('@') for username in members_text.split(',')]
+    if 'invited_usernames' not in user_data_dict[user_id]:
+        user_data_dict[user_id]['invited_usernames'] = []
     user_data_dict[user_id]['invited_usernames'].extend(usernames)
     
     # Сохраняем имена пользователей для последующей идентификации
     for username in usernames:
         logger.info(f"Пользователь {user_id} добавил {username} в команду {user_data_dict[user_id]['team_name']}")
     
-    # Пока просто информируем пользователя о необходимости подтверждения
-    # (в будущем здесь может быть реализован механизм отправки приглашений)
+    # Информируем пользователя о приглашениях, которые будут отправлены
     await update.message.reply_text(
-        f"Пользователям {', '.join(['@' + username for username in usernames])} необходимо будет подтвердить участие в команде.\n\n"
+        f"После создания команды, пользователям {', '.join(['@' + username for username in usernames])} будут отправлены приглашения.\n\n"
         "Вы можете добавить ещё участников или ввести 'готово', чтобы завершить создание команды."
     )
-    
-    # Для демонстрации сразу добавляем условные ID для пользователей
-    # В реальном приложении здесь должна быть проверка существования пользователей и их подтверждение
-    for username in usernames:
-        # Генерируем псевдослучайный ID на основе имени пользователя для демонстрации
-        # В реальном приложении нужно получать настоящие ID пользователей
-        fake_id = int(hash(username) % 1000000000)
-        user_data_dict[user_id]['team_members'].append(fake_id)
-        logger.info(f"Добавлен пользователь {username} с ID {fake_id}")
     
     return TEAM_MEMBERS
 
@@ -419,10 +833,110 @@ async def reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(reminder_text, reply_markup=reply_markup)
         return REMINDER_VIEW
     
+    elif query.data == 'leave_team_menu':
+        # Проверяем, состоит ли пользователь в каких-либо командах
+        user_id = update.effective_user.id
+        teams = db.get_teams(user_id)
+        
+        if not teams:
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='back_to_reminder')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "Вы не состоите ни в одной команде.",
+                reply_markup=reply_markup
+            )
+            return REMINDER
+            
+        # Показываем список команд для выхода
+        leave_text = "Выберите команду, из которой хотите выйти:\n\n"
+        keyboard = []
+        
+        for team in teams:
+            # Проверяем, является ли пользователь создателем команды
+            if team['created_by'] == user_id:
+                leave_text += f"📋 {team['name']} (вы создатель)\n"
+                keyboard.append([InlineKeyboardButton(f"Выйти из {team['name']}", callback_data=f"leave_creator_{team['id']}")])
+            else:
+                leave_text += f"📋 {team['name']}\n"
+                keyboard.append([InlineKeyboardButton(f"Выйти из {team['name']}", callback_data=f"leave_member_{team['id']}")])
+                
+        keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_reminder')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(leave_text, reply_markup=reply_markup)
+        return REMINDER
+    
+    elif query.data.startswith('leave_member_'):
+        # Выход обычного участника из команды
+        team_id = int(query.data.split('_')[-1])
+        team = db.get_team_by_id(team_id)
+        
+        if not team:
+            await query.edit_message_text("Команда не найдена.")
+            return ConversationHandler.END
+            
+        user_id = update.effective_user.id
+        # Удаляем пользователя из команды
+        success = db.remove_user_from_team(team_id, user_id)
+        
+        if success:
+            # Удаляем напоминания этой команды
+            reminders = db.get_reminders(user_id, team_name=team['name'])
+            for reminder in reminders:
+                db.delete_reminder(reminder['id'])
+                
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='back_to_reminder')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"Вы успешно вышли из команды '{team['name']}'. Все напоминания этой команды удалены.",
+                reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text("Произошла ошибка при выходе из команды.")
+            return ConversationHandler.END
+            
+        return REMINDER
+    
+    elif query.data.startswith('leave_creator_'):
+        # Создатель выходит и удаляет команду
+        team_id = int(query.data.split('_')[-1])
+        team = db.get_team_by_id(team_id)
+        
+        if not team:
+            await query.edit_message_text("Команда не найдена.")
+            return ConversationHandler.END
+            
+        user_id = update.effective_user.id
+        # Проверяем, является ли пользователь создателем команды
+        if team['created_by'] != user_id:
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='leave_team_menu')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "Вы не можете удалить эту команду, так как не являетесь её создателем.",
+                reply_markup=reply_markup
+            )
+            return REMINDER
+            
+        # Удаляем команду
+        success = db.delete_team(team_id)
+        
+        if success:
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='back_to_reminder')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"Команда '{team['name']}' успешно удалена. Все связанные напоминания и приглашения удалены.",
+                reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text("Произошла ошибка при удалении команды.")
+            return ConversationHandler.END
+            
+        return REMINDER
+    
     elif query.data == 'back_to_reminder':
         keyboard = [
             [InlineKeyboardButton("Создать напоминание", callback_data='create_reminder'),
              InlineKeyboardButton("Просмотреть напоминания", callback_data='view_reminders')],
+            [InlineKeyboardButton("Выйти из команды", callback_data='leave_team_menu')],
             [InlineKeyboardButton("Назад", callback_data='back_to_main')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -464,6 +978,7 @@ async def reminder_create_handler(update: Update, context: ContextTypes.DEFAULT_
         keyboard = []
         for team in teams:
             keyboard.append([InlineKeyboardButton(team['name'], callback_data=f"team_{team['name']}")])
+        keyboard.append([InlineKeyboardButton("Выйти из команды", callback_data='leave_team_from_reminder')])
         keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_reminder_create')])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("Выберите команду для напоминания:", reply_markup=reply_markup)
@@ -478,14 +993,70 @@ async def reminder_team_handler(update: Update, context: ContextTypes.DEFAULT_TY
     """Обработка выбора команды для напоминания."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
     
     if query.data.startswith('team_'):
         team_name = query.data[5:]  # Убираем префикс 'team_'
-        user_id = update.effective_user.id
         user_data_dict[user_id]['team_name'] = team_name
         
         await query.edit_message_text("Введите текст напоминания:")
         return REMINDER_TEXT
+    
+    elif query.data == 'leave_team_from_reminder':
+        # Перенаправляем на основной интерфейс выхода из команды
+        keyboard = [
+            [InlineKeyboardButton("Выйти из команды", callback_data='leave_team_menu')],
+            [InlineKeyboardButton("К меню напоминаний", callback_data='back_to_reminder')],
+            [InlineKeyboardButton("Назад", callback_data='back_to_reminder_create')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Функционал выхода из команды перенесен в основное меню напоминаний.\n"
+            "Нажмите кнопку 'Выйти из команды', чтобы перейти к выбору команды для выхода.",
+            reply_markup=reply_markup
+        )
+        return REMINDER_CREATE
+    
+    elif query.data.startswith('confirm_leave_reminder_'):
+        # Подтверждение выхода из команды
+        team_id = int(query.data.split('_')[-1])
+        team = db.get_team_by_id(team_id)
+        
+        if not team:
+            await query.edit_message_text("Команда не найдена.")
+            return ConversationHandler.END
+            
+        # Проверяем, не является ли пользователь создателем команды
+        if team['created_by'] == user_id:
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='leave_team_from_reminder')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "Вы не можете выйти из команды, так как являетесь её создателем.",
+                reply_markup=reply_markup
+            )
+            return REMINDER_TEAM
+            
+        # Удаляем пользователя из команды
+        success = db.remove_user_from_team(team_id, user_id)
+        
+        if success:
+            # Удаляем напоминания этой команды
+            reminders = db.get_reminders(user_id, team_name=team['name'])
+            for reminder in reminders:
+                db.delete_reminder(reminder['id'])
+                
+            # Возвращаемся к выбору команды для напоминания
+            keyboard = [[InlineKeyboardButton("Назад", callback_data='back_to_reminder_create')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"Вы успешно вышли из команды '{team['name']}'. Все напоминания этой команды удалены.",
+                reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text("Произошла ошибка при выходе из команды.")
+            return ConversationHandler.END
+            
+        return REMINDER_TEAM
     
     elif query.data == 'back_to_reminder_create':
         return await reminder_create_handler(update, context)
@@ -774,6 +1345,7 @@ async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         keyboard = [
             [InlineKeyboardButton("Создать команду", callback_data='create_team'),
              InlineKeyboardButton("Просмотреть команды", callback_data='view_teams')],
+            [InlineKeyboardButton("Удалить команду", callback_data='delete_team')],
             [InlineKeyboardButton("Назад", callback_data='back_to_main')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -785,6 +1357,7 @@ async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         keyboard = [
             [InlineKeyboardButton("Создать напоминание", callback_data='create_reminder'),
              InlineKeyboardButton("Просмотреть напоминания", callback_data='view_reminders')],
+            [InlineKeyboardButton("Выйти из команды", callback_data='leave_team_menu')],
             [InlineKeyboardButton("Назад", callback_data='back_to_main')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -804,6 +1377,127 @@ async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     
     # По умолчанию: возврат в главное меню
     return await menu_handler(update, context)
+
+async def invite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка действий с приглашениями."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    if query.data.startswith('accept_invite_'):
+        # Принятие приглашения
+        invite_id = int(query.data.split('_')[-1])
+        invite = db.get_invite_by_id(invite_id)
+        
+        if not invite:
+            await query.edit_message_text("Приглашение не найдено или уже обработано.")
+            return ConversationHandler.END
+            
+        # Проверяем, что статус приглашения все еще "pending"
+        if invite['status'] != 'pending':
+            await query.edit_message_text(f"Приглашение уже было {invite['status']}.")
+            return ConversationHandler.END
+            
+        # Обновляем статус приглашения
+        db.update_invite_status(invite_id, 'accepted')
+        
+        # Добавляем пользователя в команду
+        team_id = invite['team_id']
+        success = db.add_user_to_team(team_id, user_id)
+        
+        if success:
+            team = db.get_team_by_id(team_id)
+            keyboard = [[InlineKeyboardButton("В главное меню", callback_data='back_to_main')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"Вы приняли приглашение в команду '{team['name']}'!",
+                reply_markup=reply_markup
+            )
+        else:
+            await query.edit_message_text("Произошла ошибка при добавлении вас в команду.")
+            return ConversationHandler.END
+            
+        return MENU
+        
+    elif query.data.startswith('reject_invite_'):
+        # Отклонение приглашения
+        invite_id = int(query.data.split('_')[-1])
+        invite = db.get_invite_by_id(invite_id)
+        
+        if not invite:
+            await query.edit_message_text("Приглашение не найдено или уже обработано.")
+            return ConversationHandler.END
+            
+        # Проверяем, что статус приглашения все еще "pending"
+        if invite['status'] != 'pending':
+            await query.edit_message_text(f"Приглашение уже было {invite['status']}.")
+            return ConversationHandler.END
+            
+        # Обновляем статус приглашения
+        db.update_invite_status(invite_id, 'rejected')
+        
+        keyboard = [[InlineKeyboardButton("В главное меню", callback_data='back_to_main')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"Вы отклонили приглашение в команду '{invite['team_name']}'.",
+            reply_markup=reply_markup
+        )
+        return MENU
+        
+    elif query.data == 'back_to_main':
+        return await menu_handler(update, context)
+    
+    return INVITES
+
+async def leave_team_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выхода из команды."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    if query.data == 'leave_team':
+        # Функционал выхода из команды перенесен в раздел напоминаний
+        # Изменение структуры меню, перенаправляем пользователя к созданию напоминаний
+        keyboard = [
+            [InlineKeyboardButton("Создать напоминание", callback_data='create_reminder')],
+            [InlineKeyboardButton("Назад", callback_data='back_to_team')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Функционал выхода из команды перенесен в раздел напоминаний.\n"
+            "Перейдите в 'Личные напоминания' -> 'Создать напоминание' -> 'Напоминание для команды' -> 'Выйти из команды'",
+            reply_markup=reply_markup
+        )
+        return TEAM
+            
+    elif query.data.startswith('delete_team_'):
+        # Функционал удаления команды перенесен в меню команд
+        keyboard = [
+            [InlineKeyboardButton("К командам", callback_data='back_to_team')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Функционал удаления команды перенесен в раздел команд.\n"
+            "Перейдите в 'Команды' -> 'Удалить команду'",
+            reply_markup=reply_markup
+        )
+        return TEAM
+    
+    elif query.data == 'back_to_team':
+        keyboard = [
+            [InlineKeyboardButton("Создать команду", callback_data='create_team'),
+             InlineKeyboardButton("Просмотреть команды", callback_data='view_teams')],
+            [InlineKeyboardButton("Удалить команду", callback_data='delete_team')],
+            [InlineKeyboardButton("Назад", callback_data='back_to_main')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Выберите действие с командами:", reply_markup=reply_markup)
+        return TEAM
+        
+    # Если ни одно условие не совпало
+    return TEAM
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка ошибок."""
@@ -870,10 +1564,33 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 def run_bot():
     """Функция для запуска бота в non-asyncio режиме."""
     try:
-        import nest_asyncio
-        nest_asyncio.apply()  # Позволяет запустить бота в тех окружениях, где цикл событий уже запущен
-    except ImportError:
-        logger.info("nest_asyncio не установлен, используем стандартный запуск")
+        # Первое что сделаем - проверим, не запущен ли уже бот
+        import os
+        import subprocess
+        import sys
+        
+        # Проверяем количество экземпляров бота
+        try:
+            bot_processes = subprocess.check_output(['pgrep', '-f', 'run_bot_v20.py']).decode().strip().split('\n')
+            current_pid = str(os.getpid())
+            bot_processes = [pid for pid in bot_processes if pid != current_pid and pid.strip()]
+            
+            if len(bot_processes) > 0:
+                logger.info(f"Обнаружены другие экземпляры бота (PID: {', '.join(bot_processes)}). Текущий процесс: {current_pid}")
+                logger.info("Бот уже запущен, завершаем текущий процесс")
+                sys.exit(0)
+        except Exception as e:
+            logger.error(f"Ошибка при проверке запущенных экземпляров: {e}")
+        
+        # Проверяем, установлен ли модуль nest_asyncio
+        try:
+            import nest_asyncio
+            nest_asyncio.apply()  # Позволяет запустить бота в тех окружениях, где цикл событий уже запущен
+        except ImportError:
+            logger.info("nest_asyncio не установлен, используем стандартный запуск")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при подготовке к запуску бота: {e}")
         
     # Создание приложения
     application = Application.builder().token(TOKEN).build()
@@ -887,6 +1604,8 @@ def run_bot():
             TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_name_handler)],
             TEAM_MEMBERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_members_handler)],
             TEAM_VIEW: [CallbackQueryHandler(team_handler)],
+            TEAM_LEAVE: [CallbackQueryHandler(leave_team_handler)],
+            INVITES: [CallbackQueryHandler(invite_handler)],
             REMINDER: [CallbackQueryHandler(reminder_handler)],
             REMINDER_CREATE: [CallbackQueryHandler(reminder_create_handler)],
             REMINDER_TEAM: [CallbackQueryHandler(reminder_team_handler)],
@@ -940,6 +1659,8 @@ async def async_main():
             TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_name_handler)],
             TEAM_MEMBERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_members_handler)],
             TEAM_VIEW: [CallbackQueryHandler(team_handler)],
+            TEAM_LEAVE: [CallbackQueryHandler(leave_team_handler)],
+            INVITES: [CallbackQueryHandler(invite_handler)],
             REMINDER: [CallbackQueryHandler(reminder_handler)],
             REMINDER_CREATE: [CallbackQueryHandler(reminder_create_handler)],
             REMINDER_TEAM: [CallbackQueryHandler(reminder_team_handler)],
