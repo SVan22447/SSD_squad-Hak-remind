@@ -15,6 +15,7 @@ ____
 > **Примечание:** *Бот проверялся только на python 3.12, на других версиях может не выйти его установить*
 ```bash
 git clone https://github.com/SVan22447/SSD_squad-Hak-remind
+cd SSD_squad-Hak-remind
 ```
 После установки репозитория установите зависимости:
 ```bash
