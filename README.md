@@ -43,4 +43,4 @@ pip install -r requirements.txt
 
 + Разработчик - [Кулага Сергей](https://t.me/trahotrom3000)
 
-+ Ответственный за базу данных - [Печегин Михаил](https://t.me/Michael_Zone)E.md…]()
++ Ответственный за базу данных - [Печегин Михаил](https://t.me/Michael_Zone)
