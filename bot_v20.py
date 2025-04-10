@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+
 """
 Telegram бот для управления напоминаниями и командами
 Версия для python-telegram-bot 20.4 и Python 3.13
@@ -821,6 +820,11 @@ async def reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.edit_message_text("У вас нет напоминаний.", reply_markup=reply_markup)
             return REMINDER
         
+        # Сохраняем напоминания в user_data_dict для последующего использования
+        if user_id not in user_data_dict:
+            user_data_dict[user_id] = {}
+        user_data_dict[user_id]['reminders'] = reminders
+        
         # Отображение напоминаний
         reminder_text = "Ваши напоминания:\n\n"
         for i, reminder in enumerate(reminders, 1):
@@ -828,7 +832,12 @@ async def reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             team_info = f" (Команда: {reminder['team_name']})" if reminder['team_name'] else ""
             reminder_text += f"{i}. {reminder_time}{team_info}\n{reminder['reminder_text']}\n\n"
         
-        keyboard = [[InlineKeyboardButton("Назад", callback_data='back_to_reminder')]]
+        # Добавляем кнопки для удаления напоминаний
+        keyboard = []
+        for i, reminder in enumerate(reminders, 1):
+            keyboard.append([InlineKeyboardButton(f"Удалить напоминание #{i}", callback_data=f"delete_reminder_{reminder['id']}")])
+        
+        keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_reminder')])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(reminder_text, reply_markup=reply_markup)
         return REMINDER_VIEW
@@ -1011,7 +1020,6 @@ async def reminder_team_handler(update: Update, context: ContextTypes.DEFAULT_TY
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            "Функционал выхода из команды перенесен в основное меню напоминаний.\n"
             "Нажмите кнопку 'Выйти из команды', чтобы перейти к выбору команды для выхода.",
             reply_markup=reply_markup
         )
@@ -1325,6 +1333,69 @@ async def reminder_time_handler(update: Update, context: ContextTypes.DEFAULT_TY
         
         return REMINDER
 
+async def delete_reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка удаления напоминания."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith('delete_reminder_'):
+        reminder_id = int(query.data.split('_')[-1])
+        user_id = update.effective_user.id
+        
+        # Удаление напоминания
+        success = db.delete_reminder(reminder_id)
+        
+        if success:
+            logger.info(f"Напоминание {reminder_id} успешно удалено пользователем {user_id}")
+            
+            # Получаем обновленный список напоминаний
+            reminders = db.get_reminders(user_id=user_id)
+            
+            if not reminders:
+                keyboard = [[InlineKeyboardButton("Назад", callback_data='back_to_reminder')]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text("Напоминание удалено. У вас больше нет напоминаний.", reply_markup=reply_markup)
+                return REMINDER
+            
+            # Обновляем список напоминаний в user_data_dict
+            if user_id not in user_data_dict:
+                user_data_dict[user_id] = {}
+            user_data_dict[user_id]['reminders'] = reminders
+            
+            # Отображение обновленных напоминаний
+            reminder_text = "Напоминание удалено!\n\nВаши напоминания:\n\n"
+            for i, reminder in enumerate(reminders, 1):
+                reminder_time = datetime.fromisoformat(reminder['reminder_time']).strftime('%d.%m.%Y %H:%M')
+                team_info = f" (Команда: {reminder['team_name']})" if reminder['team_name'] else ""
+                reminder_text += f"{i}. {reminder_time}{team_info}\n{reminder['reminder_text']}\n\n"
+            
+            # Добавляем кнопки для удаления напоминаний
+            keyboard = []
+            for i, reminder in enumerate(reminders, 1):
+                keyboard.append([InlineKeyboardButton(f"Удалить напоминание #{i}", callback_data=f"delete_reminder_{reminder['id']}")])
+            
+            keyboard.append([InlineKeyboardButton("Назад", callback_data='back_to_reminder')])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(reminder_text, reply_markup=reply_markup)
+            return REMINDER_VIEW
+        else:
+            await query.edit_message_text("Произошла ошибка при удалении напоминания.")
+            return ConversationHandler.END
+    # Если это кнопка "Назад"
+    if query.data == 'back_to_reminder':
+        # Возврат в меню напоминаний
+        keyboard = [
+            [InlineKeyboardButton("Создать напоминание", callback_data='create_reminder'),
+             InlineKeyboardButton("Просмотреть напоминания", callback_data='view_reminders')],
+            [InlineKeyboardButton("Выйти из команды", callback_data='leave_team_menu')],
+            [InlineKeyboardButton("Назад", callback_data='back_to_main')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Выберите действие с напоминаниями:", reply_markup=reply_markup)
+        return REMINDER
+        
+    return REMINDER_VIEW
+
 async def back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка кнопки 'Назад'."""
     query = update.callback_query
@@ -1615,7 +1686,7 @@ def run_bot():
                 CallbackQueryHandler(reminder_time_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_time_handler)
             ],
-            REMINDER_VIEW: [CallbackQueryHandler(reminder_handler)],
+            REMINDER_VIEW: [CallbackQueryHandler(delete_reminder_handler)],
         },
         fallbacks=[CommandHandler("start", start)],
     )
@@ -1658,7 +1729,7 @@ async def async_main():
             TEAM: [CallbackQueryHandler(team_handler)],
             TEAM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_name_handler)],
             TEAM_MEMBERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, team_members_handler)],
-            TEAM_VIEW: [CallbackQueryHandler(team_handler)],
+            TEAM_VIEW: [CallbackQueryHandler(delete_reminder_handler)],
             TEAM_LEAVE: [CallbackQueryHandler(leave_team_handler)],
             INVITES: [CallbackQueryHandler(invite_handler)],
             REMINDER: [CallbackQueryHandler(reminder_handler)],
@@ -1670,7 +1741,7 @@ async def async_main():
                 CallbackQueryHandler(reminder_time_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_time_handler)
             ],
-            REMINDER_VIEW: [CallbackQueryHandler(reminder_handler)],
+            REMINDER_VIEW: [CallbackQueryHandler(delete_reminder_handler)],
         },
         fallbacks=[CommandHandler("start", start)],
     )
