@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Бот для Команд и Напоминаний</title>
+    <link rel="stylesheet" href="https://cdn.replit.com/agent/bootstrap-agent-dark-theme.min.css">
+    <style>
+        body {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        .header {
+            margin-bottom: 2rem;
+        }
+        .card {
+            margin-bottom: 1.5rem;
+        }
+    </style>
+</head>
+<body data-bs-theme="dark">
+    <div class="container">
+        <div class="header text-center">
+            <h1>Telegram-бот для Команд и Напоминаний</h1>
+            <p class="lead">Управляйте командами и напоминаниями через Telegram</p>
+        </div>
+
+        <div class="row">
+            <div class="col-lg-6">
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Функции Бота</h2>
+                    </div>
+                    <div class="card-body">
+                        <ul class="list-group list-group-flush">
+                            <li class="list-group-item">Создание и просмотр команд</li>
+                            <li class="list-group-item">Добавление пользователей в команды</li>
+                            <li class="list-group-item">Создание личных напоминаний</li>
+                            <li class="list-group-item">Создание напоминаний для команд</li>
+                            <li class="list-group-item">Просмотр истории напоминаний</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-6">
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Как начать</h2>
+                    </div>
+                    <div class="card-body">
+                        <p>1. Найдите бота по имени в Telegram</p>
+                        <p>2. Запустите бота командой <code>/start</code></p>
+                        <p>3. Используйте кнопки для навигации по меню</p>
+                        <p>4. Создайте свою первую команду или напоминание</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row mt-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h2>Статистика</h2>
+                        <button id="refresh-btn" class="btn btn-primary">Обновить</button>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-lg-6">
+                                <h3>Команды</h3>
+                                <div id="teams-container">
+                                    <p>Загрузка данных...</p>
+                                </div>
+                            </div>
+                            <div class="col-lg-6">
+                                <h3>Напоминания</h3>
+                                <div id="reminders-container">
+                                    <p>Загрузка данных...</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Загрузка данных при загрузке страницы
+            loadTeams();
+            loadReminders();
+
+            // Обработчик кнопки обновления
+            document.getElementById('refresh-btn').addEventListener('click', function() {
+                loadTeams();
+                loadReminders();
+            });
+
+            // Функция загрузки команд
+            function loadTeams() {
+                fetch('/teams')
+                    .then(response => response.json())
+                    .then(data => {
+                        const container = document.getElementById('teams-container');
+                        if (data.length === 0) {
+                            container.innerHTML = '<p>Нет доступных команд</p>';
+                            return;
+                        }
+
+                        let html = '<ul class="list-group">';
+                        data.forEach(team => {
+                            html += `
+                                <li class="list-group-item">
+                                    <h5>${team.name}</h5>
+                                    <p>Участников: ${team.members.length}</p>
+                                    <p>Создана: ${new Date(team.created_at).toLocaleString()}</p>
+                                </li>
+                            `;
+                        });
+                        html += '</ul>';
+                        container.innerHTML = html;
+                    })
+                    .catch(error => {
+                        console.error('Ошибка загрузки команд:', error);
+                        document.getElementById('teams-container').innerHTML = '<p>Ошибка загрузки данных</p>';
+                    });
+            }
+
+            // Функция загрузки напоминаний
+            function loadReminders() {
+                fetch('/reminders')
+                    .then(response => response.json())
+                    .then(data => {
+                        const container = document.getElementById('reminders-container');
+                        if (data.length === 0) {
+                            container.innerHTML = '<p>Нет доступных напоминаний</p>';
+                            return;
+                        }
+
+                        let html = '<ul class="list-group">';
+                        data.forEach(reminder => {
+                            const reminderTime = new Date(reminder.reminder_time).toLocaleString();
+                            const teamInfo = reminder.team_name ? `(Команда: ${reminder.team_name})` : '(Личное)';
+                            
+                            html += `
+                                <li class="list-group-item">
+                                    <h5>${reminderTime} ${teamInfo}</h5>
+                                    <p>${reminder.reminder_text}</p>
+                                </li>
+                            `;
+                        });
+                        html += '</ul>';
+                        container.innerHTML = html;
+                    })
+                    .catch(error => {
+                        console.error('Ошибка загрузки напоминаний:', error);
+                        document.getElementById('reminders-container').innerHTML = '<p>Ошибка загрузки данных</p>';
+                    });
+            }
+        });
+    </script>
+</body>
+</html>
